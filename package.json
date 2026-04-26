@@ -2,6 +2,10 @@
   "name": "@inferagraph/anthropic-provider",
   "version": "0.1.0",
   "description": "Anthropic Claude provider for InferaGraph",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/inferagraph/anthropic-provider.git"
+  },
   "type": "module",
   "main": "./dist/index.cjs",
   "module": "./dist/index.js",

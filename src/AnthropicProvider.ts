@@ -1,6 +1,6 @@
 import Anthropic from '@anthropic-ai/sdk';
 import { LLMProvider } from '@inferagraph/core';
-import type { LLMCompletionRequest, LLMCompletionResponse } from '@inferagraph/core';
+import type { LLMCompletionRequest, LLMCompletionResponse, LLMStreamChunk } from '@inferagraph/core';
 import type { AnthropicProviderConfig } from './types.js';
 
 const DEFAULT_MODEL = 'claude-sonnet-4-20250514';
@@ -43,6 +43,32 @@ export class AnthropicProvider extends LLMProvider {
         outputTokens: response.usage.output_tokens,
       },
     };
+  }
+
+  async *stream(request: LLMCompletionRequest): AsyncIterable<LLMStreamChunk> {
+    const systemMessage = request.messages.find(m => m.role === 'system');
+    const nonSystemMessages = request.messages.filter(m => m.role !== 'system');
+
+    try {
+      const stream = this.client.messages.stream({
+        model: this.model,
+        max_tokens: request.maxTokens ?? this.maxTokens,
+        ...(systemMessage && { system: systemMessage.content }),
+        messages: nonSystemMessages.map(m => ({
+          role: m.role as 'user' | 'assistant',
+          content: m.content,
+        })),
+      });
+
+      for await (const event of stream) {
+        if (event.type === 'content_block_delta' && event.delta.type === 'text_delta') {
+          yield { type: 'text' as const, content: event.delta.text };
+        }
+      }
+      yield { type: 'done' as const, content: '' };
+    } catch (error) {
+      yield { type: 'error' as const, content: error instanceof Error ? error.message : String(error) };
+    }
   }
 
   isConfigured(): boolean {
