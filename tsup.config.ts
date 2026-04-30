@@ -6,5 +6,5 @@ export default defineConfig({
   dts: true,
   sourcemap: true,
   clean: true,
-  external: ['@inferagraph/core'],
+  external: ['@inferagraph/core', '@anthropic-ai/sdk', 'voyageai'],
 });
