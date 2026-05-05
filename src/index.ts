@@ -245,7 +245,7 @@ async function* anthropicStream(
   opts: StreamOptions = {},
 ): AsyncIterable<LLMStreamEvent> {
   // Translate the contract's neutral tool shape into Anthropic's tool format.
-  // Empty tools is normalised to `undefined` so the SDK doesn't attach an
+  // Empty tools is normalized to `undefined` so the SDK doesn't attach an
   // empty array (the API would reject it).
   const tools = (opts.tools ?? []).map((t) => ({
     name: t.name,
@@ -312,7 +312,7 @@ async function* anthropicStream(
         finishReason = translateStopReason(event.delta.stop_reason);
         break;
       }
-      // message_start, message_stop — nothing to emit; finalised below.
+      // message_start, message_stop — nothing to emit; finalized below.
       default:
         break;
     }
