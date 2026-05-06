@@ -2,6 +2,7 @@ import Anthropic from '@anthropic-ai/sdk';
 import type { RawMessageStreamEvent } from '@anthropic-ai/sdk/resources/messages/messages';
 import type { VoyageAIClient } from 'voyageai';
 import type {
+  LLMMessage,
   LLMProvider,
   LLMStreamEvent,
   StreamOptions,
@@ -232,10 +233,60 @@ export function anthropicProvider(config: AnthropicProviderConfig): LLMProvider 
       return anthropicStream(client, model, prompt, opts);
     },
 
+    streamMessages(messages, opts) {
+      return anthropicStreamMessages(client, model, messages, opts);
+    },
+
     // `embed` is omitted (left as undefined on the literal) when no Voyage
     // config was supplied, so consumers see `provider.embed === undefined`.
     ...(embedFn ? { embed: embedFn } : {}),
   };
+}
+
+/**
+ * Coalesce adjacent same-role messages by joining their content with a
+ * double-newline. Anthropic's Messages API rejects two consecutive `user`
+ * (or two consecutive `assistant`) entries — turns must strictly alternate.
+ * This is a defensive merge so the engine can pass arbitrary message arrays
+ * (including a corrective system follow-up that lands as a second `user`)
+ * without bespoke knowledge of Anthropic's wire constraints.
+ *
+ * Operates only on `user` / `assistant` messages — `system` is extracted
+ * out-of-band by the caller and is not present in `entries`.
+ */
+function coalesceAdjacent(
+  entries: Array<{ role: 'user' | 'assistant'; content: string }>,
+): Array<{ role: 'user' | 'assistant'; content: string }> {
+  const out: Array<{ role: 'user' | 'assistant'; content: string }> = [];
+  for (const entry of entries) {
+    const last = out[out.length - 1];
+    if (last && last.role === entry.role) {
+      last.content = `${last.content}\n\n${entry.content}`;
+    } else {
+      out.push({ role: entry.role, content: entry.content });
+    }
+  }
+  return out;
+}
+
+/**
+ * Translate the contract's neutral tool shape into Anthropic's tool format.
+ * Returned array is empty when no tools were supplied — the caller is
+ * responsible for omitting the `tools` field entirely in that case (the API
+ * rejects an empty array).
+ */
+function translateTools(
+  tools: NonNullable<StreamOptions['tools']> | undefined,
+): Array<{
+  name: string;
+  description?: string;
+  input_schema: { type: 'object'; [k: string]: unknown };
+}> {
+  return (tools ?? []).map((t) => ({
+    name: t.name,
+    description: t.description,
+    input_schema: t.parameters as { type: 'object'; [k: string]: unknown },
+  }));
 }
 
 async function* anthropicStream(
@@ -244,15 +295,7 @@ async function* anthropicStream(
   prompt: string,
   opts: StreamOptions = {},
 ): AsyncIterable<LLMStreamEvent> {
-  // Translate the contract's neutral tool shape into Anthropic's tool format.
-  // Empty tools is normalized to `undefined` so the SDK doesn't attach an
-  // empty array (the API would reject it).
-  const tools = (opts.tools ?? []).map((t) => ({
-    name: t.name,
-    description: t.description,
-    input_schema: t.parameters as { type: 'object'; [k: string]: unknown },
-  }));
-
+  const tools = translateTools(opts.tools);
   const finalPrompt =
     opts.format === 'json' ? `${prompt}${JSON_INSTRUCTION}` : prompt;
 
@@ -268,11 +311,78 @@ async function* anthropicStream(
     opts.signal ? { signal: opts.signal } : undefined,
   )) as unknown as AsyncIterable<RawMessageStreamEvent>;
 
-  // Tool-call assembly: Anthropic streams tool_use blocks as a `content_block_start`
-  // (carrying name + id) followed by N `content_block_delta` events of type
-  // `input_json_delta` (carrying chunked JSON), terminated by `content_block_stop`.
-  // We accumulate per-content-block-index buffers and emit a single tool_call
-  // event at the matching content_block_stop.
+  yield* consumeAnthropicStream(stream);
+}
+
+async function* anthropicStreamMessages(
+  client: Anthropic,
+  model: string,
+  messages: LLMMessage[],
+  opts: StreamOptions = {},
+): AsyncIterable<LLMStreamEvent> {
+  const tools = translateTools(opts.tools);
+
+  // System messages live on Anthropic's top-level `system` field, NOT inside
+  // the `messages` array. Concatenate all system entries with double-newline
+  // so multi-system inputs (e.g., base instructions + per-call directives)
+  // collapse cleanly.
+  const systemText = messages
+    .filter((m) => m.role === 'system')
+    .map((m) => m.content)
+    .join('\n\n');
+
+  // The remaining user/assistant turns become the API's `messages`. Coalesce
+  // adjacent same-role entries because the API rejects consecutive same-role
+  // turns (e.g. two `user` in a row).
+  const turns = coalesceAdjacent(
+    messages
+      .filter((m) => m.role !== 'system')
+      .map((m) => ({ role: m.role as 'user' | 'assistant', content: m.content })),
+  );
+
+  // Apply JSON instruction by appending to the final user turn (the one the
+  // model is about to respond to). If there is no user turn at the tail, fall
+  // back to appending to the final turn regardless.
+  let finalTurns = turns;
+  if (opts.format === 'json' && finalTurns.length > 0) {
+    const last = finalTurns[finalTurns.length - 1]!;
+    finalTurns = [
+      ...finalTurns.slice(0, -1),
+      { role: last.role, content: `${last.content}${JSON_INSTRUCTION}` },
+    ];
+  }
+
+  const stream = (await client.messages.create(
+    {
+      model,
+      max_tokens: opts.maxTokens ?? DEFAULT_MAX_TOKENS,
+      ...(opts.temperature !== undefined ? { temperature: opts.temperature } : {}),
+      ...(systemText ? { system: systemText } : {}),
+      messages: finalTurns,
+      ...(tools.length > 0 ? { tools } : {}),
+      stream: true,
+    },
+    opts.signal ? { signal: opts.signal } : undefined,
+  )) as unknown as AsyncIterable<RawMessageStreamEvent>;
+
+  yield* consumeAnthropicStream(stream);
+}
+
+/**
+ * Consume an Anthropic SSE stream and yield neutral {@link LLMStreamEvent}s.
+ *
+ * Tool-call assembly: Anthropic streams tool_use blocks as a `content_block_start`
+ * (carrying name + id) followed by N `content_block_delta` events of type
+ * `input_json_delta` (carrying chunked JSON), terminated by `content_block_stop`.
+ * We accumulate per-content-block-index buffers and emit a single tool_call
+ * event at the matching content_block_stop.
+ *
+ * Always emits a final `{type: 'done'}` so consumers can release resources
+ * deterministically — the contract requires it.
+ */
+async function* consumeAnthropicStream(
+  stream: AsyncIterable<RawMessageStreamEvent>,
+): AsyncIterable<LLMStreamEvent> {
   const toolBuffers = new Map<number, { name: string; argsParts: string[] }>();
   let finishReason: 'stop' | 'length' | 'aborted' | undefined;
 

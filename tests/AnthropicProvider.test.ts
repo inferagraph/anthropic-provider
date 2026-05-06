@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import type Anthropic from '@anthropic-ai/sdk';
 import type { VoyageAIClient } from 'voyageai';
-import type { LLMStreamEvent } from '@inferagraph/core';
+import type { LLMMessage, LLMStreamEvent } from '@inferagraph/core';
 import { anthropicProvider } from '../src/index.js';
 
 /**
@@ -625,6 +625,212 @@ describe('anthropicProvider', () => {
       const provider = makeEmbedProvider();
       const result = await provider.embed!(['x']);
       expect(result).toEqual([]);
+    });
+  });
+
+  describe('streamMessages()', () => {
+    it("extracts system messages into Anthropic's top-level system field", async () => {
+      create.mockResolvedValueOnce(asyncIterableOf([]));
+      const provider = anthropicProvider({ apiKey: 'k', client });
+      const messages: LLMMessage[] = [
+        { role: 'system', content: 'You are helpful.' },
+        { role: 'user', content: 'hi' },
+      ];
+      await collect(provider.streamMessages!(messages));
+      const args = create.mock.calls[0]![0] as {
+        system?: string;
+        messages: Array<{ role: string; content: string }>;
+      };
+      expect(args.system).toBe('You are helpful.');
+      expect(args.messages).toEqual([{ role: 'user', content: 'hi' }]);
+    });
+
+    it('concatenates multiple system messages with double-newline', async () => {
+      create.mockResolvedValueOnce(asyncIterableOf([]));
+      const provider = anthropicProvider({ apiKey: 'k', client });
+      const messages: LLMMessage[] = [
+        { role: 'system', content: 'sys1' },
+        { role: 'system', content: 'sys2' },
+        { role: 'user', content: 'hi' },
+      ];
+      await collect(provider.streamMessages!(messages));
+      const args = create.mock.calls[0]![0] as { system?: string };
+      expect(args.system).toBe('sys1\n\nsys2');
+    });
+
+    it('preserves user/assistant turn order', async () => {
+      create.mockResolvedValueOnce(asyncIterableOf([]));
+      const provider = anthropicProvider({ apiKey: 'k', client });
+      const messages: LLMMessage[] = [
+        { role: 'system', content: 'sys' },
+        { role: 'user', content: 'u1' },
+        { role: 'assistant', content: 'a1' },
+        { role: 'user', content: 'u2' },
+        { role: 'assistant', content: 'a2' },
+      ];
+      await collect(provider.streamMessages!(messages));
+      const args = create.mock.calls[0]![0] as {
+        messages: Array<{ role: string; content: string }>;
+      };
+      expect(args.messages).toEqual([
+        { role: 'user', content: 'u1' },
+        { role: 'assistant', content: 'a1' },
+        { role: 'user', content: 'u2' },
+        { role: 'assistant', content: 'a2' },
+      ]);
+    });
+
+    it('coalesces adjacent same-role messages with double-newline', async () => {
+      create.mockResolvedValueOnce(asyncIterableOf([]));
+      const provider = anthropicProvider({ apiKey: 'k', client });
+      const messages: LLMMessage[] = [
+        { role: 'user', content: 'a' },
+        { role: 'user', content: 'b' },
+      ];
+      await collect(provider.streamMessages!(messages));
+      const args = create.mock.calls[0]![0] as {
+        messages: Array<{ role: string; content: string }>;
+      };
+      expect(args.messages).toEqual([{ role: 'user', content: 'a\n\nb' }]);
+    });
+
+    it('forwards the tools option', async () => {
+      create.mockResolvedValueOnce(asyncIterableOf([]));
+      const provider = anthropicProvider({ apiKey: 'k', client });
+      await collect(
+        provider.streamMessages!(
+          [{ role: 'user', content: 'hi' }],
+          {
+            tools: [
+              {
+                name: 'apply_filter',
+                description: 'Restrict the visible set',
+                parameters: {
+                  type: 'object',
+                  properties: { predicate: { type: 'string' } },
+                  required: ['predicate'],
+                },
+              },
+            ],
+          },
+        ),
+      );
+      expect(create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          tools: [
+            {
+              name: 'apply_filter',
+              description: 'Restrict the visible set',
+              input_schema: {
+                type: 'object',
+                properties: { predicate: { type: 'string' } },
+                required: ['predicate'],
+              },
+            },
+          ],
+        }),
+        undefined,
+      );
+    });
+
+    it('honors AbortSignal — signal is forwarded to the SDK and consumer can break cleanly mid-stream', async () => {
+      const ctrl = new AbortController();
+      create.mockResolvedValueOnce(
+        asyncIterableOf([
+          {
+            type: 'content_block_delta',
+            index: 0,
+            delta: { type: 'text_delta', text: 'first' },
+          },
+          {
+            type: 'content_block_delta',
+            index: 0,
+            delta: { type: 'text_delta', text: 'second' },
+          },
+        ]),
+      );
+      const provider = anthropicProvider({ apiKey: 'k', client });
+      const events: LLMStreamEvent[] = [];
+      for await (const ev of provider.streamMessages!(
+        [{ role: 'user', content: 'hi' }],
+        { signal: ctrl.signal },
+      )) {
+        events.push(ev);
+        // Consumer aborts and breaks after first chunk — matches the
+        // real-world cancel-mid-stream pattern.
+        ctrl.abort();
+        break;
+      }
+      expect(create).toHaveBeenCalledWith(
+        expect.objectContaining({ stream: true }),
+        { signal: ctrl.signal },
+      );
+      expect(events).toEqual([{ type: 'text', delta: 'first' }]);
+      expect(ctrl.signal.aborted).toBe(true);
+    });
+
+    it('yields the same chunk shape as stream() for an equivalent prompt', async () => {
+      const fixture = [
+        {
+          type: 'content_block_delta',
+          index: 0,
+          delta: { type: 'text_delta', text: 'Hello' },
+        },
+        {
+          type: 'content_block_delta',
+          index: 0,
+          delta: { type: 'text_delta', text: ' world' },
+        },
+        {
+          type: 'message_delta',
+          delta: { stop_reason: 'end_turn', stop_sequence: null },
+          usage: { output_tokens: 2 },
+        },
+        { type: 'message_stop' },
+      ];
+
+      create.mockResolvedValueOnce(asyncIterableOf(fixture));
+      const providerA = anthropicProvider({ apiKey: 'k', client });
+      const streamEvents = await collect(providerA.stream('hi'));
+
+      const second = buildMockAnthropic();
+      second.create.mockResolvedValueOnce(asyncIterableOf(fixture));
+      const providerB = anthropicProvider({
+        apiKey: 'k',
+        client: second.client,
+      });
+      const messageEvents = await collect(
+        providerB.streamMessages!([{ role: 'user', content: 'hi' }]),
+      );
+
+      expect(messageEvents).toEqual(streamEvents);
+    });
+
+    it('stream() still works (back-compat)', async () => {
+      create.mockResolvedValueOnce(
+        asyncIterableOf([
+          {
+            type: 'content_block_delta',
+            index: 0,
+            delta: { type: 'text_delta', text: 'legacy' },
+          },
+          {
+            type: 'message_delta',
+            delta: { stop_reason: 'end_turn', stop_sequence: null },
+            usage: { output_tokens: 1 },
+          },
+        ]),
+      );
+      const provider = anthropicProvider({ apiKey: 'k', client });
+      const events = await collect(provider.stream('hi'));
+      expect(events).toEqual([
+        { type: 'text', delta: 'legacy' },
+        { type: 'done', reason: 'stop' },
+      ]);
+      const args = create.mock.calls[0]![0] as {
+        messages: Array<{ role: string; content: string }>;
+      };
+      expect(args.messages).toEqual([{ role: 'user', content: 'hi' }]);
     });
   });
 });
