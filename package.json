@@ -1,6 +1,6 @@
 {
   "name": "@inferagraph/anthropic-provider",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "description": "Anthropic Claude provider for InferaGraph (with optional Voyage AI embeddings)",
   "repository": {
     "type": "git",

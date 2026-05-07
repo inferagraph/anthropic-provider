@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import type Anthropic from '@anthropic-ai/sdk';
 import type { VoyageAIClient } from 'voyageai';
-import type { LLMMessage, LLMStreamEvent } from '@inferagraph/core';
+import type { LLMMessage, LLMStreamEvent } from '@inferagraph/core/data';
 import { anthropicProvider } from '../src/index.js';
 
 /**

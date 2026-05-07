@@ -6,7 +6,7 @@ import type {
   LLMProvider,
   LLMStreamEvent,
   StreamOptions,
-} from '@inferagraph/core';
+} from '@inferagraph/core/data';
 
 /**
  * A single embedding vector — a flat array of floats.
